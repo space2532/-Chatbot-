@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Optional
 from common import client
 from function_calling import tools as assistant_tools_schema
@@ -18,14 +19,18 @@ class AssistantsManager:
         assistant_id: Optional[str] = None,
         thread_id: Optional[str] = None,
         assistant_tools: Optional[List[Dict[str, Any]]] = None,
+        memory_manager: Optional[MemoryManager] = None,
+        user: Optional[str] = None,
     ):
         self.client = client
         self.model = model
         self.system_role = system_role
         self.instruction = instruction
         self.assistant_tools = assistant_tools or []
-        self.assistant_id = assistant_id or self._create_assistant()
-        self.thread_id = thread_id or self._create_thread()
+        self.memory_manager = memory_manager
+        self.user = user
+        self.assistant_id = self._ensure_assistant_id(assistant_id)
+        self.thread_id = self._ensure_thread_id(thread_id)
         self._context: List[Dict[str, Any]] = []
         # 유지보수를 위해 시스템 메시지는 로컬 컨텍스트에만 기록
         self.add_message('developer', system_role, saved=True, persist_to_thread=False)
@@ -42,20 +47,45 @@ class AssistantsManager:
             parts.append(self.instruction.strip())
         return '\n'.join(part for part in parts if part)
 
-    def _create_assistant(self) -> str:
+    def _ensure_assistant_id(self, override_id: Optional[str]) -> str:
+        candidate_id = override_id or os.getenv('ASSISTANT_ID')
+        if candidate_id:
+            try:
+                self.client.beta.assistants.retrieve(candidate_id)
+                return candidate_id
+            except Exception as exc:
+                print(f'기존 Assistant(ID: {candidate_id}) 조회 실패: {exc}')
+
         try:
             assistant = self.client.beta.assistants.create(
                 model=self.model,
                 instructions=self._instruction_payload(),
                 tools=self.assistant_tools,
             )
+            print(f'생성된 ID {assistant.id}를 .env 파일에 ASSISTANT_ID로 추가하세요')
             return assistant.id
         except Exception as exc:
             raise RuntimeError('Failed to create Assistant for Chatbot') from exc
 
-    def _create_thread(self) -> str:
+    def _ensure_thread_id(self, override_id: Optional[str]) -> str:
+        if override_id:
+            return override_id
+
+        stored_thread_id: Optional[str] = None
+        if self.memory_manager and self.user:
+            stored_thread_id = self.memory_manager.get_thread_id(self.user)
+
+        if stored_thread_id:
+            try:
+                self.client.beta.threads.retrieve(stored_thread_id)
+                return stored_thread_id
+            except Exception as exc:
+                print(f'기존 Thread(ID: {stored_thread_id}) 조회 실패: {exc}')
+
         try:
             thread = self.client.beta.threads.create()
+            if self.memory_manager and self.user:
+                self.memory_manager.save_thread_id(self.user, thread.id)
             return thread.id
         except Exception as exc:
             raise RuntimeError('Failed to create Thread for Chatbot') from exc
@@ -140,6 +170,8 @@ class Chatbot:
             assistant_id=kwargs.get('assistant_id'),
             thread_id=kwargs.get('thread_id'),
             assistant_tools=assistant_tools_schema,
+            memory_manager=self.memoryManager,
+            user=self.user,
         )
         self.thread_id = self.assistantsManager.thread_id
         self.assistant_id = self.assistantsManager.assistant_id

@@ -12,6 +12,7 @@ pinecone_index = pinecone.Index('jjinchin-memory')
 mongo_cluster = MongoClient(os.getenv('MONGO_URI'))
 mongo_chats_collection = mongo_cluster['jjinchin']['chats']
 mongo_memory_collection = mongo_cluster['jjinchin']['memory']
+mongo_threads_collection = mongo_cluster['jjinchin']['threads']
 
 embedding_model = 'text-embedding-ada-002'
 
@@ -56,6 +57,17 @@ class MemoryManager:
     def __init__(self, **kwargs):
         self.user = kwargs['user']
         self.assistant = kwargs['assistant']
+
+    def get_thread_id(self, user_id):
+        record = mongo_threads_collection.find_one({'user_id': user_id})
+        return record.get('thread_id') if record else None
+
+    def save_thread_id(self, user_id, thread_id):
+        mongo_threads_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'thread_id': thread_id}},
+            upsert=True,
+        )
     
     def search_mongo_db(self, _id):
         search_result = mongo_memory_collection.find_one({'_id': int(_id)})

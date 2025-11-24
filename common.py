@@ -9,8 +9,7 @@ from datetime import datetime, timedelta
 
 @dataclass(frozen=True)
 class Model:
-    basic: str = 'gpt-5-mini'
-    advanced: str = 'gpt-5'
+    basic: str = 'gpt-4o-mini'
 
 
 model = Model()
