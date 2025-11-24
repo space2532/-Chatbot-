@@ -113,13 +113,17 @@ class MemoryManager:
 
     def save_chat(self, context):        
         messages = []
+        unsaved_refs = []
         for message in context:
             if message.get('saved', True): 
                 continue
             messages.append({'date': today(), 'role': message['role'], 'content': message['content']})
+            unsaved_refs.append(message)
                         
         if len(messages) > 0:           
             mongo_chats_collection.insert_many(messages)
+            for message in unsaved_refs:
+                message['saved'] = True
 
     def restore_chat(self, date=None):
         search_date = date if date is not None else today()        
@@ -194,4 +198,15 @@ class MemoryManager:
         self.delete_by_date(date)                    # 날짜별 삭제하기
 
         self.save_to_memory(summaries, date)         # Database에 저장하기
-        
+
+
+_memory_manager_singleton = None
+
+
+def set_memory_manager_instance(instance):
+    global _memory_manager_singleton
+    _memory_manager_singleton = instance
+
+
+def get_memory_manager_instance():
+    return _memory_manager_singleton

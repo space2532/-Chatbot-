@@ -1,24 +1,148 @@
-import math
-from common import client, makeup_response, gpt_num_tokens
-from memory_manager import MemoryManager
+from typing import Any, Dict, List, Optional
+from common import client
+from function_calling import tools as assistant_tools_schema
+from memory_manager import MemoryManager, set_memory_manager_instance
 from gemmin_agent import GemminAgent
 import threading
 import time
 
 
+class AssistantsManager:
+    """Lightweight helper to manage Assistants API resources and local context."""
+
+    def __init__(
+        self,
+        model: str,
+        system_role: str,
+        instruction: str,
+        assistant_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        assistant_tools: Optional[List[Dict[str, Any]]] = None,
+    ):
+        self.client = client
+        self.model = model
+        self.system_role = system_role
+        self.instruction = instruction
+        self.assistant_tools = assistant_tools or []
+        self.assistant_id = assistant_id or self._create_assistant()
+        self.thread_id = thread_id or self._create_thread()
+        self._context: List[Dict[str, Any]] = []
+        # 유지보수를 위해 시스템 메시지는 로컬 컨텍스트에만 기록
+        self.add_message('developer', system_role, saved=True, persist_to_thread=False)
+
+    @property
+    def context(self) -> List[Dict[str, Any]]:
+        return self._context
+
+    def _instruction_payload(self) -> str:
+        parts = []
+        if self.system_role:
+            parts.append(self.system_role.strip())
+        if self.instruction:
+            parts.append(self.instruction.strip())
+        return '\n'.join(part for part in parts if part)
+
+    def _create_assistant(self) -> str:
+        try:
+            assistant = self.client.beta.assistants.create(
+                model=self.model,
+                instructions=self._instruction_payload(),
+                tools=self.assistant_tools,
+            )
+            return assistant.id
+        except Exception as exc:
+            raise RuntimeError('Failed to create Assistant for Chatbot') from exc
+
+    def _create_thread(self) -> str:
+        try:
+            thread = self.client.beta.threads.create()
+            return thread.id
+        except Exception as exc:
+            raise RuntimeError('Failed to create Thread for Chatbot') from exc
+
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        saved: bool = False,
+        persist_to_thread: bool = False,
+    ) -> Dict[str, Any]:
+        message = {'role': role, 'content': content, 'saved': saved}
+        self._context.append(message)
+        if persist_to_thread and role in ('user', 'assistant'):
+            try:
+                self.client.beta.threads.messages.create(
+                    thread_id=self.thread_id,
+                    role=role,
+                    content=content,
+                )
+            except Exception as exc:
+                print(f'AssistantsManager message sync failed: {exc}')
+        return message
+
+    def add_user_message(self, content: str) -> Dict[str, Any]:
+        return self.add_message('user', content, saved=False, persist_to_thread=True)
+
+    def add_assistant_message(self, content: str) -> Dict[str, Any]:
+        # 어시스턴트 응답은 Run 결과에 의해 Thread에 자동 기록될 예정이므로
+        # 로컬 컨텍스트에만 기록한다.
+        return self.add_message('assistant', content, saved=False, persist_to_thread=False)
+
+    def create_run(self):
+        return self.client.beta.threads.runs.create(
+            thread_id=self.thread_id,
+            assistant_id=self.assistant_id,
+        )
+
+    def get_last_message(self):
+        try:
+            messages = self.client.beta.threads.messages.list(
+                thread_id=self.thread_id,
+                order='desc',
+                limit=1,
+            )
+        except Exception as exc:
+            print(f'AssistantsManager.get_last_message error: {exc}')
+            return None
+
+        if not messages.data:
+            return None
+
+        latest = messages.data[0]
+        text = ''
+        for block in getattr(latest, 'content', []):
+            text_block = getattr(block, 'text', None)
+            if text_block and getattr(text_block, 'value', None):
+                text = text_block.value
+                break
+
+        if latest.role in ('assistant', 'user') and text:
+            if not self._context or self._context[-1].get('content') != text:
+                self.add_message(latest.role, text, saved=False, persist_to_thread=False)
+        return text
+
+
 class Chatbot:
 
     def __init__(self, model, system_role, instruction, **kwargs):
-        self.context = [{'role': 'developer', 'content': system_role}]
         self.model = model
-        self.max_token_size = 16 * 1024
         self.instruction = instruction
         self.kwargs = kwargs
         self.user = kwargs['user']
         self.assistant = kwargs['assistant']
         self.gemminAgent = self._create_gemmin_agent()
         self.memoryManager = MemoryManager(**kwargs)
-        self.context.extend(self.memoryManager.restore_chat())
+        set_memory_manager_instance(self.memoryManager)
+        self.assistantsManager = AssistantsManager(
+            model=self.model,
+            system_role=system_role,
+            instruction=instruction,
+            assistant_id=kwargs.get('assistant_id'),
+            thread_id=kwargs.get('thread_id'),
+            assistant_tools=assistant_tools_schema,
+        )
+        self.thread_id = self.assistantsManager.thread_id
+        self.assistant_id = self.assistantsManager.assistant_id
         # 데몬 구동
         bg_thread = threading.Thread(target=self.background_task)
         bg_thread.daemon = True
@@ -27,87 +151,19 @@ class Chatbot:
     def background_task(self):
         while True:
             self.save_chat()
-            self.context = [ {'role': v['role'], 'content': v['content'], 'saved': True} for v in self.context ]
             self.memoryManager.build_memory()
             # time.sleep(3600)     # 1시간마다 반복
             time.sleep(120)  # 테스트 용도
 
     def add_user_message(self, message):
-        self.context.append({'role': 'user', 'content': message, 'saved': False})
-
-    def _send_request(self):
-        try:
-            if gpt_num_tokens(self.context) > self.max_token_size:
-                self.context.pop()
-                return makeup_response('메시지를 조금 짧게 보내줄래?')
-            else:
-                context = self.to_openai_context()
-                response = client.responses.create(
-                model=self.model,
-                instructions = self.instruction,
-                input=context
-                )
-        except Exception as e:
-            print(f'> Exception 오류({type(e)}) 발생:{e} ')
-            return makeup_response('[내 찐친 챗봇에 문제가 발생했습니다. 잠시 뒤 이용해주세요]')
-        return response
-
-    def send_request(self):
-        print(1)
-        memory_instruction = self.retrieve_memory()
-        self.context[-1]['content'] += memory_instruction if memory_instruction is not None else ''
-        if self.gemminAgent.monitor_user(self.to_openai_context()):
-            return makeup_response(self.gemminAgent.retort_user()) 
-        else:
-            return self._send_request()
-        
-    def retrieve_memory(self):
-        user_message = self.context[-1]['content']
-        if not self.memoryManager.needs_memory(user_message):
-            return
-
-        memory = self.memoryManager.retrieve_memory(user_message)  
-        if memory is not None:
-            whisper = (f'[귓속말]\n{self.assistant}야! 기억 속 대화 내용이야. 앞으로 이 내용을 참조하면서 답해줘. '
-                       f'알마 전에 나누었던 대화라는 점을 자연스럽게 말해줘:\n{memory}')
-            self.add_user_message(whisper)
-            return None
-        else:
-            return '[기억이 안난다고 답할 것!]'
-
-    def add_response(self, response):
-        self.context.append({
-            'role': response.output[-1].role,
-            'content': response.output_text,
-            'saved': False
-        })
-        
+        self.assistantsManager.add_user_message(message)
 
     def get_last_response(self):
-        return self.context[-1]['content']
-
-    def to_openai_context(self):
-        return [{'role': v['role'], 'content': v['content']} for v in self.context]
+        last_message = self.assistantsManager.get_last_message()
+        return last_message or ''
 
     def save_chat(self):
         self.memoryManager.save_chat(self.context)
-
-    # def clean_context(self):
-    #     for idx in reversed(range(len(self.context))):
-    #         if self.context[idx]['role'] == 'user':
-    #             content = self.context[idx].get('content', '')
-    #             if content and isinstance(content, str):
-    #                 self.context[idx]['content'] = content.split('instruction:\n')[0].strip()
-    #             break
-
-    def handle_token_limit(self, response):
-        # 누적 토큰 수가 임계점을 넘지 않도록 제어한다.
-        try:
-            if response['usage']['total_tokens'] > self.max_token_size:
-                remove_size = math.ceil(len(self.context) / 10)
-                self.context = [self.context[0]] + self.context[remove_size+1:]
-        except Exception as e:
-            print(f'> handle_token_limit exception:{e}')
 
     def _create_gemmin_agent(self):
         return GemminAgent(
@@ -115,3 +171,7 @@ class Chatbot:
                     user=self.user,
                     assistant=self.assistant,
                )
+
+    @property
+    def context(self):
+        return self.assistantsManager.context

@@ -1,7 +1,5 @@
-import json
 import requests
-# from pprint import pprint
-from common import client, model, makeup_response
+from memory_manager import get_memory_manager_instance
 
 # 위도 경도
 global_lat_lon = {
@@ -56,93 +54,68 @@ def get_currency(**kwargs):
     return krw
 
 
+def retrieve_long_term_memory(user_message: str):
+    """Lookup long-term memory via the active MemoryManager instance."""
+    manager = get_memory_manager_instance()
+    if manager is None:
+        return '[기억을 불러올 수 없습니다. 잠시 후 다시 시도해주세요.]'
+
+    memory = manager.retrieve_memory(user_message)
+    if memory is None:
+        return '[기억이 안난다고 답할 것!]'
+    return memory
+
+
 tools = [
             {
                 'type': 'function',
-                'name': 'get_celsius_temperature',
-                'description': '지정된 위치의 현재 섭씨 날씨 확인',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {
-                        'location': {
-                            'type': 'string',
-                            'description': '광역시도, e.g. 서울, 경기',
-                        }
+                'function': {
+                    'name': 'get_celsius_temperature',
+                    'description': '지정된 위치의 현재 섭씨 날씨 확인',
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {
+                            'location': {
+                                'type': 'string',
+                                'description': '광역시도, e.g. 서울, 경기',
+                            }
+                        },
+                        'required': ['location'],
                     },
-                    'required': ['location'],
                 },
             },
             {
                 'type': 'function',
-                'name': 'get_currency',
-                'description': '지정된 통화의 원(KRW) 기준의 환율 확인.',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {
-                        'currency_name': {
-                            'type': 'string',
-                            'description': '통화명, e.g. 달러환율, 엔화환율',
-                        }
+                'function': {
+                    'name': 'get_currency',
+                    'description': '지정된 통화의 원(KRW) 기준의 환율 확인.',
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {
+                            'currency_name': {
+                                'type': 'string',
+                                'description': '통화명, e.g. 달러환율, 엔화환율',
+                            }
+                        },
+                        'required': ['currency_name'],
                     },
-                    'required': ['currency_name'],
                 },
-            }
+            },
+            {
+                'type': 'function',
+                'function': {
+                    'name': 'retrieve_long_term_memory',
+                    'description': '사용자의 질문과 관련된 장기 기억(대화 요약)을 검색',
+                    'parameters': {
+                        'type': 'object',
+                        'properties': {
+                            'user_message': {
+                                'type': 'string',
+                                'description': '사용자의 최근 질문 혹은 발화',
+                            }
+                        },
+                        'required': ['user_message'],
+                    },
+                },
+            },
         ]
-
-
-class FunctionCalling:
-
-    def __init__(self, model):
-        self.available_functions = {
-            'get_celsius_temperature': get_celsius_temperature,
-            'get_currency': get_currency,
-        }
-        self.model = model
-
-    def analyze(self, user_message, tools):
-        try:
-            response = client.responses.create(
-                    model=model.basic,
-                    input=[{'role': 'user', 'content': user_message}],
-                    tools=tools,
-                    tool_choice='auto',
-                )
-            output_dict = response.output[-1].model_dump()
-            # pprint(('output dict=>', output_dict))
-            return response, output_dict['type']
-        except Exception as e:
-            print('Error occurred(analyze):', e)
-            raise ValueError(f'[analyze 오류입니다]:{e}')
-
-    def run(self, previous_response, context):
-        try:
-            analyzed_dict = previous_response.output[1].model_dump()
-            
-            func_name = analyzed_dict['name']
-            func_to_call = self.available_functions[func_name]
-            arguments = analyzed_dict['arguments']
-            if isinstance(arguments, str):
-                func_args = json.loads(arguments)
-            elif isinstance(arguments, dict):
-                func_args = arguments
-            else:
-                raise ValueError(f'Unexpected arguments type: {type(arguments)}')
-
-            # GPT가 알려주는 매개변수명과 값으로 실제 함수 호출하기
-            func_response = func_to_call(**func_args)
-
-            context.append({
-                'type': 'function_call_output',
-                'call_id': analyzed_dict['call_id'],
-                'output': str(func_response),
-                'saved': False
-            })
-
-            return client.responses.create(
-                    model=self.model,
-                    input=context,
-                    previous_response_id=previous_response.id
-                )
-        except Exception as e:
-            print('Error occurred(run):', e)
-            return makeup_response('[run 오류입니다]')
