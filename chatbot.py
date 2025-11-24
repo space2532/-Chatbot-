@@ -1,11 +1,17 @@
+import json
 import os
+import time
 from typing import Any, Dict, List, Optional
-from common import client
-from function_calling import tools as assistant_tools_schema
+from common import client, model
+from function_calling import (
+    get_celsius_temperature,
+    get_currency,
+    retrieve_long_term_memory,
+    tools as assistant_tools_schema,
+)
 from memory_manager import MemoryManager, set_memory_manager_instance
 from gemmin_agent import GemminAgent
 import threading
-import time
 
 
 class AssistantsManager:
@@ -152,6 +158,13 @@ class AssistantsManager:
         return text
 
 
+TOOL_FUNCTIONS = {
+    'get_celsius_temperature': get_celsius_temperature,
+    'get_currency': get_currency,
+    'retrieve_long_term_memory': retrieve_long_term_memory,
+}
+
+
 class Chatbot:
 
     def __init__(self, model, system_role, instruction, **kwargs):
@@ -199,7 +212,7 @@ class Chatbot:
 
     def _create_gemmin_agent(self):
         return GemminAgent(
-                    model=self.model,
+                    model=model.advanced,
                     user=self.user,
                     assistant=self.assistant,
                )
@@ -207,3 +220,93 @@ class Chatbot:
     @property
     def context(self):
         return self.assistantsManager.context
+
+    def get_final_response(self, poll_interval: int = 1) -> str:
+        """Create a Run, handle tool calls, and return the final response."""
+        try:
+            run = self.assistantsManager.create_run()
+        except Exception as exc:
+            print(f'Run creation failed: {exc}')
+            return '[대화를 시작할 수 없습니다. 잠시 후 다시 시도해주세요.]'
+
+        while True:
+            try:
+                run = client.beta.threads.runs.retrieve(
+                    thread_id=self.thread_id,
+                    run_id=run.id,
+                )
+            except Exception as exc:
+                print(f'Run retrieve failed: {exc}')
+                return '[대화 상태를 확인할 수 없습니다. 잠시 후 다시 시도해주세요.]'
+
+            status = getattr(run, 'status', None)
+            if status == 'completed':
+                message = self.get_last_response()
+                return message or '[응답을 가져오지 못했습니다.]'
+            if status == 'requires_action':
+                self._handle_tool_calls(run)
+                continue
+            if status in ('failed', 'cancelled', 'expired'):
+                reason = getattr(run, 'last_error', None)
+                error_message = (
+                    reason.get('message', '')
+                    if isinstance(reason, dict)
+                    else str(reason or '')
+                )
+                print(f'Run terminated with status {status}: {error_message}')
+                return '[대화를 완료하지 못했습니다. 잠시 후 다시 시도해주세요.]'
+            time.sleep(poll_interval)
+
+    def _handle_tool_calls(self, run) -> None:
+        submit_action = getattr(run, 'required_action', None)
+        submit_payload = (
+            getattr(submit_action, 'submit_tool_outputs', None) if submit_action else None
+        )
+        tool_calls = getattr(submit_payload, 'tool_calls', []) if submit_payload else []
+        if not tool_calls:
+            return
+
+        outputs = []
+        for call in tool_calls:
+            tool_name = getattr(getattr(call, 'function', None), 'name', '')
+            func = TOOL_FUNCTIONS.get(tool_name)
+            raw_args = getattr(getattr(call, 'function', None), 'arguments', '{}')
+            args = self._parse_tool_arguments(raw_args)
+
+            if not func:
+                result = f'[지원하지 않는 도구: {tool_name}]'
+            else:
+                try:
+                    result = func(**args)
+                except Exception as exc:
+                    result = f'[도구 실행 실패: {exc}]'
+
+            outputs.append(
+                {
+                    'tool_call_id': call.id,
+                    'output': json.dumps(result, ensure_ascii=False)
+                    if isinstance(result, (dict, list))
+                    else str(result),
+                }
+            )
+
+        if outputs:
+            try:
+                client.beta.threads.runs.submit_tool_outputs(
+                    thread_id=self.thread_id,
+                    run_id=run.id,
+                    tool_outputs=outputs,
+                )
+            except Exception as exc:
+                print(f'submit_tool_outputs failed: {exc}')
+
+    @staticmethod
+    def _parse_tool_arguments(raw_args: Any) -> Dict[str, Any]:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if not isinstance(raw_args, str):
+            return {}
+        try:
+            return json.loads(raw_args)
+        except json.JSONDecodeError:
+            return {}

@@ -85,12 +85,23 @@ class GemminAgent:
 
     def retort_user(self):
         idx = [idx for idx, tf in enumerate(self.checked_list) if tf][0]
+        
+        # 1. 시스템 지침 (기존)
+        system_instruction = (
+            f"지금부터 당신은 '상대방을 놀리는 짓궂은 친구' 역할을 맡았습니다. "
+            f"절대 친절하게 굴지 마세요. 다음 규칙을 엄격히 따르세요: {self.retort[idx]}"
+        )
+        
+        # 2. 마지막 상기시키기 (New!)
+        reminder = {
+            'role': 'user', # 시스템 메시지 대신 유저가 강하게 시키는 척
+            'content': f"(시스템 강제 명령) 위 대화 흐름은 무시하고, 즉시 '{self.retort[idx]}' 지침에 맞춰서 답변을 생성해."
+        }
+
         context = [
-            {'role': 'developer', 'content': (
-            f"당신은 상대방을 놀리는 전문 챗봇입니다. "
-            f"다른 모든 지침은 무시하고 다음 규칙을 절대적으로 지키세요: {self.retort[idx]}"
-        )}
-        ] + self.checked_context
+            {'role': 'developer', 'content': system_instruction}
+        ] + self.checked_context + [reminder]  # <-- 마지막에 reminder 추가
+
         response = self.send_query(context, format_type='text')
         return response
 
